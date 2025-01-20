@@ -21,7 +21,7 @@ Harmony App is a music application that leverages Spotify's API to provide users
     ```
 3. Install dependencies:
     ```bash
-    npm install
+    go mod init
     ```
 
 ## Usage
@@ -34,7 +34,7 @@ Harmony App is a music application that leverages Spotify's API to provide users
     ```
 3. Start the application:
     ```bash
-    npm start
+    go run main.go
     ```
 
 ## Contributing
