@@ -6,27 +6,97 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/zmb3/spotify/v2"
 	spotifyauth "github.com/zmb3/spotify/v2/auth"
 )
 
-const (
-	redirectURI  = "http://localhost:8080/callback"
-	clientID     = "a9d17c4cfa3144b6aed7a78cd3fbfdae"
-	clientSecret = "61cca6ef29b94614915f90c4a62432c0"
+var (
+	auth   *spotifyauth.Authenticator
+	ch     = make(chan *spotify.Client)
+	state  = "abc123"
+	client *spotify.Client
 )
 
-var (
+func init() {
+	// Load environment variables from .env file
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
+	redirectURI := os.Getenv("REDIRECT_URI")
+	clientID := os.Getenv("CLIENT_ID")
+	clientSecret := os.Getenv("CLIENT_SECRET")
+
 	auth = spotifyauth.New(
 		spotifyauth.WithClientID(clientID),
 		spotifyauth.WithClientSecret(clientSecret),
 		spotifyauth.WithRedirectURL(redirectURI),
-		spotifyauth.WithScopes(spotifyauth.ScopeUserReadPrivate, spotifyauth.ScopePlaylistReadPrivate),
+		spotifyauth.WithScopes(
+			spotifyauth.ScopeUserReadPrivate,
+			spotifyauth.ScopePlaylistReadPrivate,
+			spotifyauth.ScopeUserModifyPlaybackState,
+			spotifyauth.ScopeUserReadCurrentlyPlaying,
+			spotifyauth.ScopeUserReadPlaybackState,
+		),
 	)
-	ch    = make(chan *spotify.Client)
-	state = "abc123"
-)
+}
+
+func completeAuth(w http.ResponseWriter, r *http.Request) {
+	tok, err := auth.Token(r.Context(), state, r)
+	if err != nil {
+		http.Error(w, "Couldn't get token", http.StatusForbidden)
+		log.Fatal(err)
+	}
+	if st := r.FormValue("state"); st != state {
+		http.NotFound(w, r)
+		log.Fatalf("State mismatch: %s != %s\n", st, state)
+	}
+
+	client = spotify.New(auth.Client(r.Context(), tok))
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, "Login Completed!"+html)
+	ch <- client
+}
+
+func searchTrack(client *spotify.Client, trackName string) ([]spotify.FullTrack, error) {
+	results, err := client.Search(context.Background(), trackName, spotify.SearchTypeTrack)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(results.Tracks.Tracks) > 0 {
+		return results.Tracks.Tracks, nil
+	}
+	return nil, fmt.Errorf("no track found for: %s", trackName)
+}
+
+func playTrack(client *spotify.Client, trackURI spotify.URI) error {
+	// List available devices
+	devices, err := client.PlayerDevices(context.Background())
+	if err != nil {
+		return err
+	}
+
+	if len(devices) == 0 {
+		return fmt.Errorf("no active devices found")
+	}
+
+	// Select the first available device
+	deviceID := devices[0].ID
+
+	err = client.PlayOpt(context.Background(), &spotify.PlayOptions{
+		DeviceID: &deviceID,
+		URIs:     []spotify.URI{trackURI},
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
 func main() {
 	// Start the HTTP server for Spotify's OAuth callback
@@ -34,6 +104,7 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Println("Got request for:", r.URL.String())
 	})
+
 	go func() {
 		err := http.ListenAndServe(":8080", nil)
 		if err != nil {
@@ -63,54 +134,82 @@ func main() {
 	}
 	fmt.Println("You are logged in as:", user.ID, user.DisplayName)
 
-
-	    // Retrieve and display user's playlists
-		playlists, err := client.CurrentUsersPlaylists(context.Background())
-		if (err != nil) {
-			log.Fatal(err)
-		}
-	
-		for _, playlist := range playlists.Playlists {
-			fmt.Println("Playlist name:", playlist.Name)
-		}
-
-		// Search and play a track
-		searchAndPlayTrack(client, "Shape of You")
-}
-
-func completeAuth(w http.ResponseWriter, r *http.Request) {
-	tok, err := auth.Token(r.Context(), state, r)
+	// Retrieve and display user's playlists
+	playlists, err := client.CurrentUsersPlaylists(context.Background())
 	if err != nil {
-		http.Error(w, "Couldn't get token", http.StatusForbidden)
 		log.Fatal(err)
 	}
-	if st := r.FormValue("state"); st != state {
-		http.NotFound(w, r)
-		log.Fatalf("State mismatch: %s != %s\n", st, state)
+
+	for _, playlist := range playlists.Playlists {
+		fmt.Println("Playlist name:", playlist.Name)
 	}
 
-	client := spotify.New(auth.Client(r.Context(), tok))
-	fmt.Fprintf(w, "Login Completed!")
-	ch <- client
+	// Handle player actions
+	http.HandleFunc("/player/", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		action := strings.TrimPrefix(r.URL.Path, "/player/")
+		fmt.Println("Got request for:", action)
+		var err error
+		switch action {
+		case "play":
+			trackURI := r.URL.Query().Get("uri")
+			if trackURI != "" {
+				err = playTrack(client, spotify.URI(trackURI))
+			} else {
+				err = client.Play(ctx)
+			}
+		case "pause":
+			err = client.Pause(ctx)
+		case "next":
+			err = client.Next(ctx)
+		case "previous":
+			err = client.Previous(ctx)
+		case "shuffle":
+			playerState, err := client.PlayerState(ctx)
+			if err != nil {
+				log.Print(err)
+			}
+			_ = client.Shuffle(ctx, !playerState.ShuffleState)
+		}
+		if err != nil {
+			log.Print(err)
+		}
+
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "Action completed")
+	})
+
+	// Handle search action
+	http.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		trackName := r.URL.Query().Get("track")
+		if trackName == "" {
+			http.Error(w, "Missing track parameter", http.StatusBadRequest)
+			return
+		}
+
+		tracks, err := searchTrack(client, trackName)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html")
+		for _, track := range tracks {
+			fmt.Fprintf(w, "Track: %s by %s<br/>", track.Name, track.Artists[0].Name)
+			fmt.Fprintf(w, "<a href=\"/player/play?uri=%s\">Play</a><br/><br/>", track.URI)
+		}
+	})
+
+	// Keep the server running
+	select {}
 }
 
-
-func searchAndPlayTrack(client *spotify.Client, trackName string) {
-	results, err := client.Search(context.Background(), trackName, spotify.SearchTypeTrack)
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    if len(results.Tracks.Tracks) > 0 {
-        track := results.Tracks.Tracks[0]
-        fmt.Println("Playing track:", track.Name, "by", track.Artists[0].Name)
-		err = client.PlayOpt(context.Background(), &spotify.PlayOptions{
-			URIs: []spotify.URI{track.URI},
-		})
-        if err != nil {
-            log.Fatal(err)
-        }
-    } else {
-        fmt.Println("No track found for:", trackName)
-    }
-}
+var html = `
+<br/>
+<a href="/player/play">Play</a><br/>
+<a href="/player/pause">Pause</a><br/>
+<a href="/player/next">Next track</a><br/>
+<a href="/player/previous">Previous Track</a><br/>
+<a href="/player/shuffle">Shuffle</a><br/>
+<a href="/search?track=Shape%20of%20You">Search for ""</a><br/>
+`
